@@ -1,0 +1,22 @@
+services:
+  route-audit:
+    build: .
+    image: route-coverage-audit:latest
+    container_name: route-coverage-audit
+    ports:
+      - "8000:8000"
+    environment:
+      # 已发布活动版本的持久化位置（挂在命名卷上，容器重建后数据保留）
+      ROUTE_AUDIT_STATE_FILE: /data/active.json
+    volumes:
+      - route-audit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+volumes:
+  route-audit-data:

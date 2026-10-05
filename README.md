@@ -27,12 +27,18 @@ URL 解码与规范化模型上模拟路由器匹配，判定：
 - `GET /active`：从**同一快照**返回当前活动版本的路由、审计结果与 OpenAPI
   `paths`；状态落盘保存，容器重启后仍可读到已发布版本。初始版本为 0、路由为空。
 
-最后是一个**只读预检**端点：
+最后是两个**只读**端点：
 
 - `POST /precheck`：提交候选路由与一批请求样本（方法 + 绝对路径），在**固定的
   活动快照**上比较每个样本在「活动路由 vs 候选路由」下分别命中哪条路由——
   候选须先通过与 `/publish` 完全相同的校验，通过时逐样本返回规范化路径、两侧
   命中路由的原始下标 / id / 规范化模板以及是否改投；预检不修改活动配置。
+- `POST /migrate-links`：为**已发布路由生成旧链接迁移清单**。提交按注册顺序
+  排列的目标路由与一批旧链接（方法 + 绝对路径）；目标配置须先通过与
+  `/publish` 完全相同的校验（否则整批拒绝），随后在**固定的活动快照**上为每条
+  旧链接找旧命中，按**同方法下唯一的非空显式 id** 对应到目标路由，提取旧模板
+  的命名参数与末尾 `**` 各段填入目标模板生成 canonical path，并再按整套目标
+  路由重新选胜方（只有胜方恰是对应目标路由才返回路径）；同样不修改活动配置。
 
 结果按「胜方优先级 → 方法 → 胜方规范化路径 → 原始下标」稳定排序。
 
@@ -663,6 +669,147 @@ curl -s -X POST http://localhost:8000/precheck \
 继续正常比较；`%2F` 在样本中始终是单段字面量，不会变成段分隔符。
 信封级校验失败（如缺少 `samples`）返回 **422**，与其它端点一致。
 
+### `POST /migrate-links`
+
+**只读**的旧链接迁移清单：为已经发布的路由生成一批旧链接在**目标路由集**下的
+新 canonical path。端点**先固定当前活动快照**（版本 + 路由），整个迁移都基于
+这同一份快照；迁移本身不修改活动配置。
+
+处理流程：
+
+1. **目标集校验（整批闸门）**：目标路由（`routes`，按注册顺序排列，结构与
+   `/publish` 相同）必须先通过与 `/publish` **完全相同**的校验：任一解析错误、
+   导出路径重复或 `full_shadow` → `status: "rejected"`，返回含原始下标的
+   `parse_errors` / `conflicts`，**整批不迁移**（`results` 为空）；
+2. **找旧命中**：每条旧链接（方法 + 绝对路径）先做与审计相同的解码/规范化，
+   再在**活动路由**中按既有规则（优先级降序、同级注册先后）选出唯一命中；
+3. **按显式 id 对应**：旧命中路由与目标路由以**同方法下唯一的非空显式
+   `id`** 对应——旧命中缺少非空 `id`、该 `id` 在活动或目标同方法路由中不唯一
+   （歧义）、或目标侧没有该 `id`，该链接都无法迁移；
+4. **提取与回填**：提取旧模板的**命名参数**实际段值与末尾 `**` 吸收的各段，
+   按**同名**填入目标模板：
+   - 目标的每个命名参数都必须能从旧的**同名命名参数**取到值（旧 `**` 的段不
+     会顶替目标参数；旧路由多余的参数会被忽略）；
+   - 目标含末尾 `**` 时，旧 `**` 的各段整体搬入；目标不含 `**` 时旧尾部必须
+     为空（零段）；
+   - 每个段值还必须满足目标参数声明的约束（`int` / `uuid` / `slug` / 通用）；
+5. **重新选胜方**：生成的 canonical path 再按**整套目标路由**重新匹配，只有
+   胜方**恰好是**第 3 步对应的那条目标路由才返回路径，避免新路径被另一条目标
+   路由（如新增的更具体静态路由）截获。
+
+任一链接失败（旧无命中、id 缺失/歧义、目标缺失、参数无法完整对应、约束不满足、
+被截获等）只在该链接的 `errors` 中逐项说明，**不影响其它链接**。
+
+请求体（`routes` 与 `/publish` 同构、按注册顺序；`links` 为旧链接）：
+
+```json
+{
+  "routes": [
+    {"method": "GET", "path": "/api/users/{id:int}", "priority": 5, "id": "user"},
+    {"method": "GET", "path": "/api/assets/**", "id": "assets"}
+  ],
+  "links": [
+    {"method": "GET", "path": "/v1/users/42"},
+    {"method": "GET", "path": "/v1/assets/img/logo.png"}
+  ]
+}
+```
+
+```bash
+# 先发布一套旧路由（版本 1）
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 0,
+    "routes": [
+      {"method": "GET", "path": "/v1/users/{id:int}", "priority": 5, "id": "user"},
+      {"method": "GET", "path": "/v1/assets/**", "id": "assets"}
+    ]
+  }'
+
+# 再生成迁移清单
+curl -s -X POST http://localhost:8000/migrate-links \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"method": "GET", "path": "/api/users/{id:int}", "priority": 5, "id": "user"},
+      {"method": "GET", "path": "/api/assets/**", "id": "assets"}
+    ],
+    "links": [
+      {"method": "GET", "path": "/v1/users/42"},
+      {"method": "GET", "path": "/v1/assets/img/logo.png"}
+    ]
+  }'
+```
+
+响应（`results` 与 `links` 等长、同序；`version` 为所固定快照的版本）：
+
+```json
+{
+  "status": "migrated",
+  "version": 1,
+  "parse_errors": [],
+  "conflicts": [],
+  "results": [
+    {"index": 0, "method": "GET", "path": "/v1/users/42",
+     "active_version": 1, "normalized_path": "/v1/users/42",
+     "active": {"index": 0, "id": "user",
+                "normalized_template": "/v1/users/{id:int}"},
+     "target": {"index": 0, "id": "user",
+                "normalized_template": "/api/users/{id:int}"},
+     "canonical_path": "/api/users/42", "errors": []},
+    {"index": 1, "method": "GET", "path": "/v1/assets/img/logo.png",
+     "active_version": 1, "normalized_path": "/v1/assets/img/logo.png",
+     "active": {"index": 1, "id": "assets",
+                "normalized_template": "/v1/assets/**"},
+     "target": {"index": 1, "id": "assets",
+                "normalized_template": "/api/assets/**"},
+     "canonical_path": "/api/assets/img/logo.png", "errors": []}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `migrated`（目标通过校验并逐项迁移）/ `rejected`（目标未通过 `/publish` 同款校验，整批拒绝） |
+| `version` | 本次迁移所固定的活动快照版本号 |
+| `parse_errors[]` / `conflicts[]` | rejected 时：目标路由的解析错误/重复导出路径与 `full_shadow` 冲突（含原始下标） |
+| `results[]` | migrated 时逐链接的迁移结果，与 `links` 等长、同序 |
+
+`results[]` 每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 链接在输入数组中的原始下标 |
+| `method` / `path` | 大写规范化后的方法 / 原始旧链接回显 |
+| `active_version` | 本次迁移所固定的活动快照版本号 |
+| `normalized_path` | 规范化后的旧链接路径；路径非法时为 `null` |
+| `active` | 旧链接在活动快照上的命中路由 `{index, id, normalized_template}`；无命中为 `null` |
+| `target` | 按显式 id 对应的目标路由；无法定位（缺失/歧义）时为 `null` |
+| `canonical_path` | 回填目标模板并通过胜方复核的 canonical path；失败时为 `null` |
+| `errors[]` | 逐项失败原因 `{code, field, message}`；非空时 `canonical_path` 为 `null` |
+
+错误码一览：
+
+| code | 含义 |
+| --- | --- |
+| `invalid_method` | 旧链接使用了不支持的 HTTP 方法 |
+| `invalid_path` | 旧链接不是以 `/` 开头的绝对路径，或含非法百分号转义等 |
+| `no_active_match` | 活动路由中没有任何路由命中该旧链接 |
+| `active_id_missing` | 旧命中路由缺少非空显式 `id`（生成的 `route-<下标>` 不算） |
+| `ambiguous_id` | 该显式 `id` 在活动或目标的**同方法**路由中不唯一 |
+| `target_missing` | 目标路由中没有携带该显式 `id` 的同方法路由 |
+| `parameter_mismatch` | 目标命名参数在旧模板中没有同名参数，或目标无 `**` 而旧尾部非空 |
+| `constraint_violated` | 提取出的段值不满足目标参数约束（或空段无法渲染） |
+| `target_not_winner` | 生成路径在整套目标路由上被**另一条**路由截获 |
+| `not_canonical` | 生成结果未通过完整规范化往返校验 |
+
+百分号编码与 `/render-paths` 的**单段**语义完全一致：`%2F` 始终是段内字面量，
+既不会被拆成段分隔符，也不会被重复编码（`%2F` → `%2F`、`%252F` → `%252F`）；
+非 ASCII 字符按 UTF-8 字节转义。非法链接（不支持的方法、相对路径、非法转义等）
+逐项记入 `errors`，不中止批处理。信封级校验失败（缺少 `routes` / `links` 等）
+返回 **422**，与其它端点一致。
+
 ---
 
 ## “不可证实”（unprovable）是什么意思？
@@ -702,11 +849,12 @@ app/
   render.py          # 按模板与参数值反向生成 canonical path（约束校验、单段编码）
   publish.py         # 活动版本存储：候选校验、CAS 替换、原子落盘与重启恢复
   compare.py         # 只读预检：固定活动快照，比较样本在两侧的路由归属
+  migrate.py         # 只读迁移：旧链接经显式 id 映射到目标路由并生成 canonical path
   models.py          # Pydantic 请求/响应模型
   main.py            # FastAPI 路由：/analyze、/export-openapi、/render-paths、
-                     # /publish、/active、/precheck、/healthz
+                     # /publish、/active、/precheck、/migrate-links、/healthz
 tests/               # pytest 测试（规范化、模板、相交、API、导出、反向渲染、
-                     # 发布/活动版本、归属预检、unprovable）
+                     # 发布/活动版本、归属预检、旧链接迁移、unprovable）
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

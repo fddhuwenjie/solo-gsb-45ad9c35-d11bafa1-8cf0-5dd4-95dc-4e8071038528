@@ -6,12 +6,15 @@ from fastapi import FastAPI
 
 from .compare import compare_attribution
 from .exporter import export_openapi_fragment
+from .migrate import migrate_links
 from .models import (
     ActiveResponse,
     AnalyzeRequest,
     AnalyzeResponse,
     ExportOpenApiRequest,
     ExportOpenApiResponse,
+    MigrateRequest,
+    MigrateResponse,
     PrecheckRequest,
     PrecheckResponse,
     PublishRequest,
@@ -31,7 +34,8 @@ app = FastAPI(
         "paths 片段，或按模板与参数值反向生成可调用的 canonical path。"
         "支持把校验通过的路由配置发布为可持久化的活动版本（CAS 递增），"
         "并从同一快照读取路由、审计结果与 OpenAPI paths；"
-        "还可在固定活动快照上只读预检候选路由，比较样本请求在两侧的归属。"
+        "还可在固定活动快照上只读预检候选路由，比较样本请求在两侧的归属，"
+        "或为已发布路由生成旧链接迁移清单。"
     ),
     version="1.0.0",
 )
@@ -87,3 +91,11 @@ def precheck(request: PrecheckRequest) -> PrecheckResponse:
     # 先固定活动快照：版本与活动路由在整个比较期间保持一致，且不修改活动配置。
     snapshot = store.get()
     return compare_attribution(snapshot, request.routes, request.samples)
+
+
+@app.post("/migrate-links", response_model=MigrateResponse, tags=["migrate"])
+def migrate_legacy_links(request: MigrateRequest) -> MigrateResponse:
+    """旧链接迁移清单：固定活动快照，把命中活动路由的旧链接重写到目标路由。"""
+    # 先固定活动快照：版本与活动路由在整个迁移期间保持一致，且不修改活动配置。
+    snapshot = store.get()
+    return migrate_links(snapshot, request.routes, request.links)

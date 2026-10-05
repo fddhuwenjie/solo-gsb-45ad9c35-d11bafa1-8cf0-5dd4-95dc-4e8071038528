@@ -304,3 +304,74 @@ class PrecheckResponse(BaseModel):
         default_factory=list,
         description="compared 时：与 samples 等长、同序的逐样本归属比较",
     )
+
+
+class MigrateRequest(BaseModel):
+    routes: list[RouteIn] = Field(
+        ..., description="按注册顺序排列的目标路由（与 /publish 同构）"
+    )
+    links: list[SampleIn] = Field(
+        ..., description="旧链接（方法 + 绝对路径），迁移结果按相同顺序返回"
+    )
+
+
+class MigrateError(BaseModel):
+    code: str = Field(
+        description=(
+            "unsupported_method=方法不支持；invalid_path=路径非法；"
+            "no_active_match=活动路由无命中；missing_route_id=旧命中路由缺少显式 id；"
+            "ambiguous_route_id=显式 id 在同方法下不唯一；"
+            "target_missing=目标配置缺少同方法同 id 的路由；"
+            "parameter_unmapped=参数/通配尾段无法在两侧模板间完整对应；"
+            "constraint_violation=提取值不满足目标参数约束；"
+            "not_canonical=生成路径未通过规范化往返校验；"
+            "intercepted=生成路径在目标全集中的胜方不是对应目标路由"
+        )
+    )
+    message: str
+
+
+class MigrateResult(BaseModel):
+    index: int = Field(description="旧链接在输入数组中的原始下标")
+    version: int = Field(description="本次迁移所固定的活动快照版本号")
+    method: str = Field(description="大写规范化后的方法回显")
+    path: str = Field(description="原始路径回显")
+    normalized_path: Optional[str] = Field(
+        default=None, description="规范化后的旧链接路径；路径非法时为 null"
+    )
+    active: Optional[AttributionHit] = Field(
+        default=None, description="活动快照侧的旧命中路由；无命中为 null"
+    )
+    target: Optional[AttributionHit] = Field(
+        default=None, description="按显式 id 对应到的目标路由；无法对应时为 null"
+    )
+    canonical_path: Optional[str] = Field(
+        default=None, description="迁移后的 canonical path；无法迁移时为 null"
+    )
+    errors: list[MigrateError] = Field(
+        default_factory=list,
+        description="逐项失败原因；非空时 canonical_path 为 null，不影响其它项",
+    )
+
+
+MigrateStatus = Literal["generated", "rejected"]
+
+
+class MigrateResponse(BaseModel):
+    status: MigrateStatus = Field(
+        description="generated=目标配置通过校验并逐项生成迁移结果；"
+        "rejected=目标配置未通过 /publish 同款校验，整批不生成"
+    )
+    version: int = Field(description="本次迁移所固定的活动快照版本号")
+    parse_errors: list[ParseError] = Field(
+        default_factory=list,
+        description="rejected 时：目标路由的解析错误/重复导出路径（含原始下标）",
+    )
+    conflicts: list[Conflict] = Field(
+        default_factory=list,
+        description="rejected 时：目标路由的 full_shadow 冲突（含双方原始下标）",
+    )
+    results: list[MigrateResult] = Field(
+        default_factory=list,
+        description="generated 时：与 links 等长、同序的逐项迁移结果",
+    )

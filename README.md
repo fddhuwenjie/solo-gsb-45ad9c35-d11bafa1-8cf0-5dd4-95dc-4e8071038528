@@ -34,6 +34,14 @@ URL 解码与规范化模型上模拟路由器匹配，判定：
   候选须先通过与 `/publish` 完全相同的校验，通过时逐样本返回规范化路径、两侧
   命中路由的原始下标 / id / 规范化模板以及是否改投；预检不修改活动配置。
 
+以及一个**只读迁移**端点：
+
+- `POST /migrate-links`：提交目标路由与一批旧链接（方法 + 绝对路径），在
+  **固定的活动快照**上为每条旧链接找到活动侧命中，按同方法下唯一的非空显式
+  id 对应到目标路由，把从旧模板提取的命名参数与末尾 `**` 各段填入目标模板，
+  生成迁移后的 canonical path；目标配置须先通过与 `/publish` 完全相同的校验，
+  逐项失败只影响该项，迁移不修改活动配置。
+
 结果按「胜方优先级 → 方法 → 胜方规范化路径 → 原始下标」稳定排序。
 
 ---
@@ -663,6 +671,129 @@ curl -s -X POST http://localhost:8000/precheck \
 继续正常比较；`%2F` 在样本中始终是单段字面量，不会变成段分隔符。
 信封级校验失败（如缺少 `samples`）返回 **422**，与其它端点一致。
 
+### `POST /migrate-links`
+
+**只读**迁移：为已发布路由生成旧链接迁移清单。端点**先固定当前活动快照**
+（版本 + 路由），再把每条旧链接重写到目标路由的 canonical path；迁移本身
+不修改活动配置。
+
+处理流程：
+
+1. 目标路由集先通过与 `/publish` **完全相同**的校验：任一解析错误、导出路径
+   重复或 `full_shadow` → `status: "rejected"`，返回含原始下标的
+   `parse_errors` / `conflicts`，**整批不生成迁移项**（`results` 为空）；
+2. 校验通过时逐条处理旧链接：链接路径按与审计相同的解码/规范化规则处理
+   （`%2F` 不会变成段分隔符），在活动路由中按「优先级降序、同级注册先后」
+   找出**唯一旧命中**；
+3. 旧命中路由须带**非空显式 id**，且该 id 在同方法下于活动与目标两侧都唯一，
+   以此对应到唯一的目标路由；
+4. 按旧模板逐段提取命名参数与末尾 `**` 各段（已规范化的单段文本），按名填入
+   目标模板：目标参数全部有着落、旧提取值全部被目标模板接收、取值满足目标
+   约束、旧 `**` 尾段在目标侧有归宿时，才生成 canonical path；
+5. 生成路径还要按**整套目标路由**重新选出胜方，只有胜方是对应目标路由才返回
+   该路径，避免新路径被另一条路由截获。
+
+请求体（`routes` 与 `/publish` 同构、按注册顺序排列；`links` 为方法 +
+绝对路径的旧链接）：
+
+```json
+{
+  "routes": [
+    {"method": "GET", "path": "/v2/users/{id:int}", "priority": 5, "id": "user"},
+    {"method": "GET", "path": "/v2/assets/**", "id": "assets"}
+  ],
+  "links": [
+    {"method": "GET", "path": "/users/42"},
+    {"method": "GET", "path": "/assets/img/a%2Fb.png"},
+    {"method": "GET", "path": "/users/abc"}
+  ]
+}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/migrate-links \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"method": "GET", "path": "/v2/users/{id:int}", "priority": 5, "id": "user"},
+      {"method": "GET", "path": "/v2/assets/**", "id": "assets"}
+    ],
+    "links": [
+      {"method": "GET", "path": "/users/42"},
+      {"method": "GET", "path": "/assets/img/a%2Fb.png"},
+      {"method": "GET", "path": "/users/abc"}
+    ]
+  }'
+```
+
+响应（`results` 与 `links` 等长、同序；`version` 为所固定快照的版本；
+假设活动版本 1 中是 `/users/{id:int}`（id `user`）与 `/assets/**`
+（id `assets`）两条路由）：
+
+```json
+{
+  "status": "generated",
+  "version": 1,
+  "parse_errors": [],
+  "conflicts": [],
+  "results": [
+    {"index": 0, "version": 1, "method": "GET", "path": "/users/42",
+     "normalized_path": "/users/42",
+     "active": {"index": 0, "id": "user",
+                "normalized_template": "/users/{id:int}"},
+     "target": {"index": 0, "id": "user",
+                "normalized_template": "/v2/users/{id:int}"},
+     "canonical_path": "/v2/users/42", "errors": []},
+    {"index": 1, "version": 1, "method": "GET", "path": "/assets/img/a%2Fb.png",
+     "normalized_path": "/assets/img/a%2Fb.png",
+     "active": {"index": 1, "id": "assets",
+                "normalized_template": "/assets/**"},
+     "target": {"index": 1, "id": "assets",
+                "normalized_template": "/v2/assets/**"},
+     "canonical_path": "/v2/assets/img/a%2Fb.png", "errors": []},
+    {"index": 2, "version": 1, "method": "GET", "path": "/users/abc",
+     "normalized_path": "/users/abc",
+     "active": null, "target": null, "canonical_path": null,
+     "errors": [{"code": "no_active_match",
+                 "message": "no active route matches this link"}]}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `generated`（目标配置通过校验并逐项生成迁移结果）/ `rejected`（目标配置未通过 `/publish` 同款校验，整批不生成） |
+| `version` | 本次迁移所固定的活动快照版本号 |
+| `parse_errors[]` / `conflicts[]` | rejected 时：目标路由的解析错误/重复导出路径与 `full_shadow` 冲突（含原始下标），含义同 `/publish` |
+| `results[]` | generated 时：与 `links` 等长、同序的逐项迁移结果 |
+
+`results[]` 每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 旧链接在输入数组中的原始下标 |
+| `version` | 所固定的活动快照版本号 |
+| `method` / `path` | 大写规范化后的方法 / 原始路径回显 |
+| `normalized_path` | 规范化后的旧链接路径；路径非法时为 `null` |
+| `active` / `target` | 旧命中路由 / 对应目标路由 `{index, id, normalized_template}`；无法确定时为 `null` |
+| `canonical_path` | 迁移后的 canonical path；无法迁移时为 `null` |
+| `errors[]` | 逐项失败原因（`code` + `message`）；非空时 `canonical_path` 为 `null`，不影响其它项 |
+
+错误码一览：`unsupported_method`、`invalid_path`、`no_active_match`、
+`missing_route_id`、`ambiguous_route_id`、`target_missing`、
+`parameter_unmapped`、`constraint_violation`、`not_canonical`、`intercepted`。
+
+迁移规则要点：
+
+- 路由对应只看**同方法下的非空显式 id**：缺省/空 id、或同 id 在同方法下
+  出现多条（活动侧或目标侧），都无法对应；
+- 参数按名对应且必须**完整**：目标参数缺同名来源、旧参数或旧 `**` 尾段在
+  目标模板中无归宿，都判为无法迁移；
+- 提取值是已规范化的单段文本，`%2F` 等保留字符保持原编码——不拆段、不
+  重复编码；生成结果还会做一次完整的规范化往返校验；
+- 非法旧链接只影响该项；整个端点只读，不修改活动配置。
+- 信封级校验失败（如缺少 `links`）返回 **422**，与其它端点一致。
+
 ---
 
 ## “不可证实”（unprovable）是什么意思？
@@ -702,11 +833,12 @@ app/
   render.py          # 按模板与参数值反向生成 canonical path（约束校验、单段编码）
   publish.py         # 活动版本存储：候选校验、CAS 替换、原子落盘与重启恢复
   compare.py         # 只读预检：固定活动快照，比较样本在两侧的路由归属
+  migrate.py         # 只读迁移：把命中活动路由的旧链接重写到目标路由
   models.py          # Pydantic 请求/响应模型
   main.py            # FastAPI 路由：/analyze、/export-openapi、/render-paths、
-                     # /publish、/active、/precheck、/healthz
+                     # /publish、/active、/precheck、/migrate-links、/healthz
 tests/               # pytest 测试（规范化、模板、相交、API、导出、反向渲染、
-                     # 发布/活动版本、归属预检、unprovable）
+                     # 发布/活动版本、归属预检、旧链接迁移、unprovable）
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
